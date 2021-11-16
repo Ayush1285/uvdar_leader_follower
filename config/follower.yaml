@@ -1,12 +1,12 @@
 reference_frame: "gps_origin"
 
 control_action_interval: 0.01 # [s]
-uvdar_msg_interval: 0.1 # [s]
+uvdar_msg_interval: 0.05 # [s]
 
 # offset from the leader position to be maintained
 desired_offset:
   x: -4.0 # [m]
-  y: 5.0 # [m]
+  y: 4.0 # [m]
   z: 0.0 # [m]
 
 # rotation offset around the world vertical axis

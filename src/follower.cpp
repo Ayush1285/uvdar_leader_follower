@@ -1,5 +1,8 @@
 #include <uvdar_leader_follower/follower.h>
 #include <uvdar_leader_follower/FollowerConfig.h>
+#include <cmath>
+#include <cstdlib>
+#include <ctime>
 
 bool is_initialized     = false;
 bool got_odometry       = false;
@@ -10,21 +13,25 @@ Eigen::Vector3d follower_position_odometry;
 Eigen::Vector3d follower_linear_velocity_odometry;
 double          follower_heading_odometry;
 double          follower_heading_rate_odometry;
-
+double          des_follower_heading;
+int             check=0, sign;
 Eigen::Vector3d follower_position_tracker;
 Eigen::Vector3d follower_linear_velocity_tracker;
 double          follower_heading_tracker;
 double          follower_heading_rate_tracker;
+double          cmdvel,followerspeed;
+double          dotproduct;
+double          disttoleader,prevdistleader = 0.0,del_disttoleader = 0.0;
 
 Eigen::Vector3d leader_position;
-ros::Time       last_leader_contact;
+ros::Time       last_leader_contact,prev_time;
 
 // dynamically reconfigurable
 Eigen::Vector3d position_offset          = Eigen::Vector3d(0.0, 0.0, 0.0);
 double          heading_offset           = 0.0;
 double          uvdar_msg_interval       = 0.1;
-bool            use_estimator            = false;
-bool            use_speed_tracker        = false;
+bool            use_estimator            = true;
+bool            use_speed_tracker        = true;
 bool            use_trajectory_reference = false;
 
 VelocityEstimator estimator;
@@ -144,7 +151,7 @@ void FollowerController::receiveUvdar(const geometry_msgs::PoseWithCovarianceSta
   got_uvdar           = true;
 
   leader_position = leader_new_position;
-
+  
   if (use_estimator && is_initialized) {
     estimator.fuse(leader_new_position);
   }
@@ -155,6 +162,7 @@ void FollowerController::receiveUvdar(const geometry_msgs::PoseWithCovarianceSta
 ReferencePoint FollowerController::createReferencePoint() {
   ReferencePoint point;
 
+  
   // sanity check
   if (!is_initialized || !got_odometry || !got_uvdar || !got_tracker_output) {
     point.position        = Eigen::Vector3d(0, 0, 0);
@@ -162,17 +170,31 @@ ReferencePoint FollowerController::createReferencePoint() {
     point.use_for_control = false;
     return point;
   }
+  
 
-  if (use_estimator) {
+  if(use_estimator){
+    if(abs(leader_heading-prev_heading)>0.3){
+      point.position.x() = follower_position_tracker.x();
+      point.position.y() = follower_position_tracker.y();
+      point.position.z() = 3.0;
+    }
+    else{
+    
     point.position.x() = leader_predicted_position.x() + position_offset.x();
     point.position.y() = leader_predicted_position.y() + position_offset.y();
     point.position.z() = 3.0;
-  } else {
+  }}
+  else {
+   
     point.position.x() = leader_position.x() + position_offset.x();
     point.position.y() = leader_position.y() + position_offset.y();
     point.position.z() = 3.0;
   }
-  point.heading         = heading_offset;
+  
+  
+  point.heading         = des_follower_heading;
+  
+  prev_heading = leader_heading;
   point.use_for_control = true;
 
   return point;
@@ -228,7 +250,24 @@ ReferenceTrajectory FollowerController::createReferenceTrajectory() {
 /* createSpeedCommand //{ */
 SpeedCommand FollowerController::createSpeedCommand() {
   SpeedCommand command;
-
+  //dot product of follower's linear velocity vector and position vector of leader from follower's frame
+  dotproduct = follower_linear_velocity_tracker.x()*(leader_predicted_position.x()-follower_position_tracker.x()) + follower_linear_velocity_tracker.y()*(leader_predicted_position.y()-follower_position_tracker.y());
+  if(dotproduct<0){
+    sign = -1;
+  }
+  else{
+    sign = 1;
+  }
+  //distance between leader and follower
+  disttoleader = sqrt(pow(leader_predicted_position.x()-follower_position_tracker.x(),2.0)+pow(leader_predicted_position.y()-follower_position_tracker.y(),2.0));
+  //change in distance between leader and follower
+  del_disttoleader = disttoleader-prevdistleader;
+  if(check ==0){
+    del_disttoleader = 0;
+    check = 1;
+  }
+  //desired orientation of follower towards leader 
+  des_follower_heading = atan2((leader_predicted_position.y()-follower_position_tracker.y()),(leader_predicted_position.x()-follower_position_tracker.x()));
   if (!got_odometry || !got_uvdar || !got_tracker_output) {
     command.velocity        = Eigen::Vector3d(0, 0, 0);
     command.heading         = 0;
@@ -237,11 +276,39 @@ SpeedCommand FollowerController::createSpeedCommand() {
   }
 
   if (use_estimator) {
-    command.velocity = leader_predicted_velocity;
-    command.height   = leader_predicted_position.z() + position_offset.z();
-    command.heading  = follower_heading_odometry;
+    // speed of follower with sign, showing follower approaching leader or getting away from leader 
+    followerspeed= sign*sqrt(pow(follower_linear_velocity_tracker.x(),2.0)+pow(follower_linear_velocity_tracker.y(),2.0));
+    /*modelled as spring damper system with blocks at two end, follower will experience attractive force if
+    distance between them is more than 6, and similarly will face repulsion if distance is less than 6*/
+    if(disttoleader>6){ 
+      cmdvel = followerspeed + 0.5*(disttoleader-6)+50*del_disttoleader;  // 0.5 - spring coefficient
+      //cmdvel - desired speed                                            // 50 - damper coefficient
+      if(cmdvel>5.0){
+        cmdvel = 4.5;
+      }
+      command.velocity[0] = cmdvel*cos(des_follower_heading);
+      command.velocity[1] = cmdvel*sin(des_follower_heading);
+      command.velocity[2] = 0;
+      command.height = 3.0;
+      command.heading = des_follower_heading;
+    }
+    else{
+      // 1 - spring coefficient
+      // 50 - damper coefficient
+      cmdvel = followerspeed + 1*(disttoleader-6)+50*del_disttoleader;
+      if(cmdvel<-5.0){
+        cmdvel = -4.5;
+      }
+      command.velocity[0] = cmdvel*cos(des_follower_heading);
+      command.velocity[1] = cmdvel*sin(des_follower_heading);
+      command.velocity[2] = 0;
+      command.height = 3.0;
+      command.heading = des_follower_heading;
+    }
+    
   }
-
+ 
+  prevdistleader = disttoleader;
   if (use_speed_tracker) {
     command.use_for_control = true;
   } else {
